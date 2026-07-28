@@ -65,7 +65,7 @@ class GR00TPolicy:
     and the GR00T server's nested observation / split-action dict protocol."""
 
     def __init__(self, host: str, port: int = 5555, timeout_ms: int = 60_000,
-                 use_waist: bool = True, image_hw: tuple[int, int] = (256, 342)):
+                 use_waist: bool = True, image_hw=(256, 342)):
         self._context = zmq.Context()
         self._host = host
         self._port = port
