@@ -5,14 +5,20 @@
 #   bash launch_groot_server.sh <hf-repo-id> [port]
 #
 # Examples:
-#   bash launch_groot_server.sh XiaoweiLinXL/unitree-GR00T-load-bottle-water-30000step
+#   # put-away-tools ABSOLUTE, no-waist model (current deployment):
+#   bash launch_groot_server.sh XiaoweiLinXL/groot-unitree-load-bottle-water-20k
 #   bash launch_groot_server.sh EmbodyX/UnitreeG1-GR00T-putaway-30000step 5556
-#   bash launch_groot_server.sh yigao7117/sort_tool-groot-Nstep
+#   bash launch_groot_server.sh XiaoweiLinXL/unitree-GR00T-load-bottle-water-30000step
 #
 # The local checkpoint directory is derived from the repo name:
 #   ~/Isaac-GR00T/checkpoints/<repo-name>
 #
-# Port defaults to 5555. Port must be open in the Azure NSG for the robot's source IP.
+# Port defaults to 5555. With the recommended SSH tunnel (ssh -N -L 5555:localhost:5555)
+# the port need NOT be opened in the Azure NSG. Only open it in the NSG if you connect to
+# the public host directly.
+#
+# Auth: if the checkpoint repo is private, or the gated backbone (nvidia/Cosmos-Reason2-2B)
+# must be fetched, export a read-capable token first:  export HF_TOKEN=hf_...
 
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"

@@ -20,10 +20,12 @@ Action layout returned by infer():
     [:, 15]    right gripper absolute target
     [:, 16]    waist yaw ABSOLUTE target (rad)  — only when use_waist=True
 
-NOTE: Even though the model was trained with use_relative_action=True, the server's
-StateActionProcessor.unapply_action() already converts relative deltas → absolute positions
-using the obs-time arm_q we send in the state observation. Do NOT add obs_arm_q to the
-returned arm actions — they are already absolute joint position targets.
+NOTE: The returned arm actions are ABSOLUTE joint position targets — apply them directly,
+do NOT add obs_arm_q. This holds for both action reps:
+  - Absolute model (current put-away-tools checkpoint): the head predicts absolute targets.
+  - Relative model (legacy bottle-water): the server's StateActionProcessor.unapply_action()
+    already reconstructs absolute = obs_arm_q + delta using the state we send.
+Either way the client applies the values as-is.
 """
 
 import time

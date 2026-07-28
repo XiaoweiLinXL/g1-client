@@ -29,28 +29,33 @@ action returned by GR00TPolicy.infer(): ndarray [H, 17]
 
 Precondition: robot already in 'ai' motion mode (set via the Unitree app).
 
-Usage (from the repo root):
+This branch targets the put-away-tools ABSOLUTE, no-waist checkpoint
+(XiaoweiLinXL/groot-unitree-load-bottle-water-20k — the repo name is legacy; it holds the
+put-away-tools model). That model has NO waist joint, so always pass --no-waist, and the
+16-dim state/action layout drops the trailing waist column.
+
+Usage (put-away-tools, no-waist) — from the repo root:
   python main_groot.py \\
       --iface enp0s31f6 \\
-      --server-host a10-pi05-embodyx.southcentralus.cloudapp.azure.com \\
-      --server-port 5555 \\
-      --prompt "load the water bottle"
+      --server-host 127.0.0.1 --server-port 5555 \\
+      --no-waist \\
+      --prompt "put the battery into the battery bin and the screw driver into the philips bin"
 
-Test mode (no robot required — tests server connectivity):
+Test mode (no robot required — tests server connectivity through the SSH tunnel):
   python main_groot.py \\
       --test \\
-      --server-host a10-pi05-embodyx.southcentralus.cloudapp.azure.com \\
-      --server-port 5555 \\
-      --prompt "Load the bottle water to the shelf"
+      --server-host 127.0.0.1 --server-port 5555 \\
+      --no-waist --dry-run
 
-For checkpoints without a waist joint (e.g. EmbodyX/UnitreeG1-GR00T-putaway-30000step),
-add --no-waist:
-  python main_groot.py \\
-      --iface enp0s31f6 \\
-      --server-host a10-pi05-embodyx.southcentralus.cloudapp.azure.com \\
-      --server-port 5556 \\
-      --no-waist \\
-      --prompt "put away the tools"
+The server runs on the Azure A10 and is reached over an SSH tunnel from the laptop:
+  ssh -i a10-1.5-inference-fabricio_key.pem -N \\
+      -L 5555:localhost:5555 \\
+      fabricio@a10-pi05-embodyx.southcentralus.cloudapp.azure.com
+so --server-host is 127.0.0.1 (the local end of the tunnel).
+
+NOTE: the legacy bottle-water checkpoint used a waist joint (17-dim) and the default
+prompt "Load the bottle water to the shelf"; that path still works if you drop --no-waist
+and pass the matching --prompt.
 """
 
 import argparse
@@ -73,12 +78,13 @@ ARM_JOINT_NAMES = [
     "R_pitch", "R_roll ", "R_yaw ", "R_elbow", "R_wrR ", "R_wrP ", "R_wrY ",
 ]
 
-# Init pose for GR00T tasks — mean of episode-start states across all 132 training
-# episodes (observation.state[:14]).  Distinct from INIT_POSE_READY (arms-at-sides
-# neutral) which the model never saw at the beginning of a task.
+# Init pose for GR00T tasks — mean of episode-start states across all 100 training
+# episodes of put-away-tools-v2_new_cam (observation.state[:14]).  Distinct from
+# INIT_POSE_READY (arms-at-sides neutral) which the model never saw at the beginning
+# of a task.  Recomputed for the put-away-tools (absolute, no-waist) checkpoint.
 GROOT_INIT_POSE = np.array([
-    -0.145,  0.022,  0.019, -0.274, -0.077,  0.104, -0.039,   # left
-    -0.117,  0.037,  0.132, -0.369, -0.127,  0.151, -0.071,   # right
+    +0.064,  0.008,  0.009, -0.208, -0.072, -0.014, -0.035,   # left
+    +0.044, -0.012,  0.045, -0.204, -0.013, -0.021,  0.017,   # right
 ], dtype=np.float64)
 
 _FAKE_IMG_H, _FAKE_IMG_W = 480, 640
@@ -413,8 +419,10 @@ def main() -> None:
                    help="GR00T ZMQ server port (default 5555)")
     p.add_argument("--image-server", default="192.168.123.164",
                    help="G1 PC2 image-server host (default 192.168.123.164)")
-    p.add_argument("--prompt", default="Load the bottle water to the shelf",
-                   help="Language instruction for the policy")
+    p.add_argument("--prompt",
+                   default="put the battery into the battery bin and the screw driver into the philips bin",
+                   help="Language instruction for the policy. Must match the training task string "
+                        "exactly (meta/tasks.jsonl of the checkpoint's dataset).")
     p.add_argument("--max-chunks", type=int, default=300,
                    help="Number of action chunks to run before stopping")
     p.add_argument("--control-hz", type=float, default=30.0,
@@ -435,8 +443,10 @@ def main() -> None:
     p.add_argument("--image-hw", type=int, nargs=2, default=[256, 342],
                    metavar=("H", "W"),
                    help="Image size (H W) to resize frames to before sending to server. "
-                        "Default 256 342 (bottle-water checkpoints). "
-                        "Use 256 256 for EmbodyX/UnitreeG1-GR00T-putaway-30000step.")
+                        "Default 256 342 preserves the 480x640 (3:4) training aspect ratio of "
+                        "put-away-tools-v2_new_cam (letterbox padding is off in the processor, so "
+                        "keep the training aspect). The processor resizes to the model input "
+                        "internally; smaller = less tunnel bandwidth.")
     p.add_argument("--auto-start", action="store_true",
                    help="Skip the post-init Enter prompt and start immediately.")
     p.add_argument("--dry-run", action="store_true",
