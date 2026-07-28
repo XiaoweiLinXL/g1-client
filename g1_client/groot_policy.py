@@ -28,6 +28,8 @@ do NOT add obs_arm_q. This holds for both action reps:
 Either way the client applies the values as-is.
 """
 
+from __future__ import annotations
+
 import time
 
 import cv2
