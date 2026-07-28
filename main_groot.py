@@ -203,8 +203,14 @@ def log_chunk_ranges(chunk_id: int, deltas: np.ndarray) -> None:
 
 # ---------- inference loop ----------
 
-_ARM_JOINT_MIN = np.array([-2.8,-0.4,-2.4,-0.5,-1.9,-1.5,-1.5,-2.8,-2.2,-2.4,-0.5,-1.9,-1.5,-1.5])
-_ARM_JOINT_MAX = np.array([ 1.4, 2.2, 2.4, 2.9, 1.9, 1.5, 1.5, 1.4, 0.4, 2.4, 2.9, 1.9, 1.5, 1.5])
+# Safety clamp applied to predicted arm targets before dispatch. These MUST cover the
+# joint range the policy was trained on, otherwise legitimate motion is truncated. The
+# put-away-tools-v2_new_cam training data reaches elbow ~-0.95 rad (state idx 3 = L_elbow
+# [-0.937, 0.830], idx 10 = R_elbow [-0.959, 0.767]) and wrist-pitch ~1.57, so the elbow
+# mins were relaxed from -0.5 -> -1.1 and wrist-pitch maxes from 1.5 -> 1.7. The old -0.5
+# elbow floor clipped the reach-into-bin motion and stalled the place after grasping.
+_ARM_JOINT_MIN = np.array([-2.8,-0.4,-2.4,-1.1,-1.9,-1.5,-1.5,-2.8,-2.2,-2.4,-1.1,-1.9,-1.5,-1.5])
+_ARM_JOINT_MAX = np.array([ 1.4, 2.2, 2.4, 2.9, 1.9, 1.7, 1.5, 1.4, 0.4, 2.4, 2.9, 1.9, 1.7, 1.5])
 
 
 def _run_inference_loop(arm, grip, cam, policy, args) -> None:
