@@ -27,12 +27,14 @@ state/action dimension order must match how the LeRobot dataset was recorded.
     observation.images.cam_left_wrist  uint8 HxWx3 RGB
     observation.images.cam_right_wrist uint8 HxWx3 RGB
     observation.state                  float32 (16,) = [14 arm q | L grip | R grip]
+                                       float32 (17,) with --with-waist: adds waist yaw at index 16
     prompt                             str
 
-  action returned: ndarray [H, 16]
+  action returned: ndarray [H, 16] or [H, 17] with --with-waist
     [:, 0:14] absolute arm joint targets (rad), order == ARM_JOINTS
     [:, 14]   left gripper  (rad, [GRIPPER_MIN, GRIPPER_MAX])
     [:, 15]   right gripper (rad, [GRIPPER_MIN, GRIPPER_MAX])
+    [:, 16]   waist yaw absolute target (rad) — only with --with-waist
 
 If your dataset stored the gripper normalized (e.g. 0..1) instead of rad, scale
 [:, 14:16] here before set_targets — that is the only spot likely to need a
@@ -128,6 +130,12 @@ class _FakeArm:
     def get_arm_q(self) -> np.ndarray:
         return self._q.copy()
 
+    def get_waist_yaw(self) -> float:
+        return 0.0
+
+    def set_waist_yaw_target(self, q: float):
+        pass
+
     def set_arm_target(self, q):
         self._q = np.asarray(q, dtype=np.float32)
 
@@ -182,7 +190,11 @@ def _jpeg_to_rgb(jpeg_bytes: bytes) -> np.ndarray:
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
-def build_obs(cam, arm, grip, prompt: str, send_jpeg: bool = False) -> dict:
+WAIST_CHANNEL = 16
+
+
+def build_obs(cam, arm, grip, prompt: str, send_jpeg: bool = False,
+              with_waist: bool = False) -> dict:
     """Assemble one openpi observation from the (unchanged) controllers.
 
     send_jpeg=False (default): images are decoded RGB uint8 arrays — the legacy
@@ -198,7 +210,10 @@ def build_obs(cam, arm, grip, prompt: str, send_jpeg: bool = False) -> dict:
     imgs = cam.get_obs_images()  # dict of JPEG bytes (BGR, q90), LeRobot keys
     left_q, right_q = grip.get_state()
     arm_q = arm.get_arm_q()  # (14,)
-    state = np.concatenate([arm_q, [left_q, right_q]]).astype(np.float32)  # (16,)
+    state_parts = [arm_q, [left_q, right_q]]
+    if with_waist:
+        state_parts.append([arm.get_waist_yaw()])
+    state = np.concatenate(state_parts).astype(np.float32)  # (16,) or (17,)
 
     def _img(key):
         return imgs[key] if send_jpeg else _jpeg_to_rgb(imgs[key])
@@ -343,7 +358,7 @@ def _run_inference_loop_sync(arm, grip, cam, policy, args) -> None:
     for c in range(args.max_chunks):
         # Fetch obs and infer
         log.info(f"[chunk {c}] Inferring...")
-        obs = build_obs(cam, arm, grip, prompt, args.send_jpeg)
+        obs = build_obs(cam, arm, grip, prompt, args.send_jpeg, args.with_waist)
         result = policy.infer(obs)
         actions = np.asarray(result["actions"], dtype=np.float64)
         if actions.ndim != 2 or actions.shape[1] < 16:
@@ -364,6 +379,8 @@ def _run_inference_loop_sync(arm, grip, cam, policy, args) -> None:
                 float(np.clip(a[LEFT_GRIPPER_CHANNEL], GRIPPER_MIN, GRIPPER_MAX)),
                 float(np.clip(a[RIGHT_GRIPPER_CHANNEL], GRIPPER_MIN, GRIPPER_MAX)),
             )
+            if args.with_waist:
+                arm.set_waist_yaw_target(float(a[WAIST_CHANNEL]))
             sleep = dt - (time.time() - tic)
             if sleep > 0:
                 time.sleep(sleep)
@@ -394,7 +411,7 @@ def _run_inference_loop_async(arm, grip, cam, policy, args) -> None:
 
     # First chunk is a blocking infer (nothing to overlap it against yet).
     log.info(f"First inference (prompt={prompt!r})")
-    result = policy.infer(build_obs(cam, arm, grip, prompt, args.send_jpeg))
+    result = policy.infer(build_obs(cam, arm, grip, prompt, args.send_jpeg, args.with_waist))
     actions = np.asarray(result["actions"], dtype=np.float64)
     if actions.ndim != 2 or actions.shape[1] < 16:
         raise RuntimeError(f"Unexpected action shape {actions.shape} (want [H, 16])")
@@ -432,10 +449,12 @@ def _run_inference_loop_async(arm, grip, cam, policy, args) -> None:
                 float(np.clip(a[LEFT_GRIPPER_CHANNEL], GRIPPER_MIN, GRIPPER_MAX)),
                 float(np.clip(a[RIGHT_GRIPPER_CHANNEL], GRIPPER_MIN, GRIPPER_MAX)),
             )
+            if args.with_waist:
+                arm.set_waist_yaw_target(float(a[WAIST_CHANNEL]))
             last_cmd = a
 
             if th is None and (n - i) <= lead:
-                obs_next = build_obs(cam, arm, grip, prompt, args.send_jpeg)
+                obs_next = build_obs(cam, arm, grip, prompt, args.send_jpeg, args.with_waist)
                 th = threading.Thread(target=_infer_worker,
                                       args=(policy, obs_next, box),
                                       daemon=True, name=f"infer-{c}")
@@ -626,6 +645,9 @@ def main() -> None:
     p.add_argument("--image-server", default="192.168.123.164",
                    help="G1 PC2 image-server host (default 192.168.123.164)")
     p.add_argument("--prompt", default="pick the red bottle")
+    p.add_argument("--with-waist", action="store_true",
+                   help="Include waist yaw in observation state (17-dim) and command it "
+                        "from action channel 16. Use with checkpoints trained with waist.")
     p.add_argument("--send-jpeg", action="store_true",
                    help="Send compressed JPEG bytes instead of decoded RGB arrays "
                         "(~12x smaller upload — fixes a network-bound wait_recv). "

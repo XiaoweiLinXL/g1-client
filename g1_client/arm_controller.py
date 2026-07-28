@@ -151,7 +151,8 @@ class ArmController:
         self._state_ready = threading.Event()
 
         self._target_lock = threading.Lock()
-        self._q_target = None  # set on first state update
+        self._q_target = None       # set in _init_cmd_from_state
+        self._waist_yaw_target = 0.0  # set in _init_cmd_from_state
 
         # Guards every read/write of self.cmd (+ CRC + Write) so the publish
         # thread, set_arm_kp, and disable_arm_sdk never race on the shared
@@ -208,6 +209,14 @@ class ArmController:
             raise RuntimeError("No state received yet")
         return np.array([state.motor_state[j].q for j in ARM_JOINTS], dtype=np.float64)
 
+    def get_waist_yaw(self) -> float:
+        """Return current waist yaw joint position (radians)."""
+        with self._state_lock:
+            state = self._latest_state
+        if state is None:
+            raise RuntimeError("No state received yet")
+        return float(state.motor_state[G1JointIndex.WaistYaw].q)
+
     def set_arm_target(self, q_target: np.ndarray):
         """Set the 14-DoF arm joint target (radians). Thread-safe. Clipped to
         per-joint position limits."""
@@ -216,6 +225,11 @@ class ArmController:
         clipped = np.clip(q_target, ARM_JOINT_MIN, ARM_JOINT_MAX)
         with self._target_lock:
             self._q_target = clipped.astype(np.float64).copy()
+
+    def set_waist_yaw_target(self, q: float) -> None:
+        """Set the waist yaw joint target (radians). Thread-safe. Rate-limited in publish loop."""
+        with self._target_lock:
+            self._waist_yaw_target = float(q)
 
     def set_velocity_limit(self, vlim: float):
         """Update the per-tick velocity clamp at runtime.
@@ -359,10 +373,11 @@ class ArmController:
                 self.cmd.motor_cmd[j].kp = self.kp_arm
                 self.cmd.motor_cmd[j].kd = self.kd_arm
 
-        # Seed q_target with current arm pose so the first publish doesn't jump
+        # Seed targets with current pose so the first publish doesn't jump
         with self._target_lock:
             self._q_target = np.array([state.motor_state[j].q for j in ARM_JOINTS],
                                       dtype=np.float64)
+            self._waist_yaw_target = float(state.motor_state[G1JointIndex.WaistYaw].q)
 
     def _clip_target(self, q_target: np.ndarray, q_current: np.ndarray) -> np.ndarray:
         delta = q_target - q_current
@@ -376,9 +391,15 @@ class ArmController:
 
                 with self._target_lock:
                     q_target = self._q_target.copy()
+                    waist_yaw_target = self._waist_yaw_target
 
                 q_current = self.get_arm_q()
                 q_cmd = self._clip_target(q_target, q_current)
+
+                # Rate-limit waist yaw motion (same velocity_limit as arms).
+                waist_prev = self.cmd.motor_cmd[G1JointIndex.WaistYaw].q
+                max_d = self.velocity_limit * self.control_dt
+                waist_cmd = waist_prev + max(-max_d, min(waist_yaw_target - waist_prev, max_d))
 
                 # Hold _cmd_lock across mutation + CRC + Write so the published
                 # frame's CRC always matches its body, even if set_arm_kp or
@@ -388,6 +409,9 @@ class ArmController:
                         self.cmd.motor_cmd[j].q = float(q_cmd[idx])
                         self.cmd.motor_cmd[j].dq = 0.0
                         self.cmd.motor_cmd[j].tau = 0.0
+                    self.cmd.motor_cmd[G1JointIndex.WaistYaw].q = waist_cmd
+                    self.cmd.motor_cmd[G1JointIndex.WaistYaw].dq = 0.0
+                    self.cmd.motor_cmd[G1JointIndex.WaistYaw].tau = 0.0
                     self.cmd.crc = self.crc.Crc(self.cmd)
                     self.pub.Write(self.cmd)
 

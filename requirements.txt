@@ -10,3 +10,5 @@ numpy
 opencv-python
 websockets
 msgpack
+pyzmq
+msgpack-numpy
