@@ -350,7 +350,16 @@ def _infer_worker(policy, obs: dict, box: dict) -> None:
     except BaseException as e:  # surface to the main thread
         box["err"] = e
 
-def _run_inference_loop_sync(arm, grip, cam, policy, args) -> None:
+def _load_kin(args):
+    if args.tauff_scale <= 0:
+        log.warning("gravity feedforward OFF (--tauff-scale 0): arm will sag under finite kp")
+        return None
+    from g1_client.kinematics import G1DualArmKinematics
+    log.info(f"Loading G1 arm kinematics for gravity feedforward (scale={args.tauff_scale})")
+    return G1DualArmKinematics()
+
+
+def _run_inference_loop_sync(arm, grip, cam, policy, args, kin=None) -> None:
     """Synchronous loop: execute chunk fully, then fetch obs and infer next chunk."""
     dt = 1.0 / args.control_hz
     prompt = args.prompt
@@ -381,12 +390,17 @@ def _run_inference_loop_sync(arm, grip, cam, policy, args) -> None:
             )
             if args.with_waist:
                 arm.set_waist_yaw_target(float(a[WAIST_CHANNEL]))
+            if kin is not None:
+                arm.set_arm_tauff(kin.gravity_torque(a[ARM_CHANNELS], args.tauff_scale))
             sleep = dt - (time.time() - tic)
             if sleep > 0:
                 time.sleep(sleep)
 
+    if kin is not None:
+        arm.set_arm_tauff(np.zeros(14))
 
-def _run_inference_loop_async(arm, grip, cam, policy, args) -> None:
+
+def _run_inference_loop_async(arm, grip, cam, policy, args, kin=None) -> None:
     """Overlapped receding-horizon loop — lingbot Algorithm 2 pattern adapted
     for the stateless openpi infer API.
 
@@ -451,6 +465,8 @@ def _run_inference_loop_async(arm, grip, cam, policy, args) -> None:
             )
             if args.with_waist:
                 arm.set_waist_yaw_target(float(a[WAIST_CHANNEL]))
+            if kin is not None:
+                arm.set_arm_tauff(kin.gravity_torque(np.asarray(a[ARM_CHANNELS]), args.tauff_scale))
             last_cmd = a
 
             if th is None and (n - i) <= lead:
@@ -502,6 +518,8 @@ def _run_inference_loop_async(arm, grip, cam, policy, args) -> None:
         log_chunk_ranges(c, next_actions)
         actions = next_actions
 
+    if kin is not None:
+        arm.set_arm_tauff(np.zeros(14))
     _summarize_timing(infer_recs, chunk_recs, args)
 
 
@@ -585,12 +603,13 @@ def _run_test(args) -> None:
     policy = None
     # Import PolicyClient here so --test works even without g1_client installed.
     from g1_client.policy_client import PolicyClient
+    kin = _load_kin(args)
     loop = _run_inference_loop_sync if args.sync else _run_inference_loop_async
     log.info(f"Loop mode: {'sync' if args.sync else 'async (overlapped)'}")
     try:
         log.info(f"Connecting to policy server {args.server_host}:{args.server_port}")
         policy = PolicyClient(host=args.server_host, port=args.server_port)
-        loop(arm, grip, cam, policy, args)
+        loop(arm, grip, cam, policy, args, kin=kin)
     finally:
         _cleanup(arm, grip, cam, policy)
 
@@ -623,10 +642,11 @@ def _run_real(args) -> None:
         _wait_for_operator(args)
         log.info(f"Switching arm kp to inference value: {args.inference_kp_arm}")
         arm.set_arm_kp(args.inference_kp_arm)
+        kin = _load_kin(args)
         policy = PolicyClient(host=args.server_host, port=args.server_port)
         loop = _run_inference_loop_sync if args.sync else _run_inference_loop_async
         log.info(f"Loop mode: {'sync' if args.sync else 'async (overlapped)'}")
-        loop(arm, grip, cam, policy, args)
+        loop(arm, grip, cam, policy, args, kin=kin)
         _initialize_pose(arm, grip, args, INIT_POSE_READY)
     finally:
         _cleanup(arm, grip, cam, policy)
@@ -687,6 +707,9 @@ def main() -> None:
     p.add_argument("--init-gripper-right", type=float, default=5.0)
     p.add_argument("--auto-start", action="store_true",
                    help="Skip the post-init Enter prompt and start immediately.")
+    p.add_argument("--tauff-scale", type=float, default=1.0,
+                   help="Scale factor for gravity feedforward torque (default 1.0). "
+                        "Set 0 to disable gravity compensation entirely.")
     args = p.parse_args()
 
     if not args.test and args.iface is None:

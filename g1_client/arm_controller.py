@@ -153,6 +153,10 @@ class ArmController:
         self._target_lock = threading.Lock()
         self._q_target = None       # set in _init_cmd_from_state
         self._waist_yaw_target = 0.0  # set in _init_cmd_from_state
+        # Per-joint feedforward torque (N·m) applied as motor_cmd[j].tau.
+        # Defaults to zeros (tau=0, identical to prior behaviour). Set via
+        # set_arm_tauff() to feed gravity-compensation torques during inference.
+        self._tauff = np.zeros(14, dtype=np.float64)
 
         # Guards every read/write of self.cmd (+ CRC + Write) so the publish
         # thread, set_arm_kp, and disable_arm_sdk never race on the shared
@@ -230,6 +234,18 @@ class ArmController:
         """Set the waist yaw joint target (radians). Thread-safe. Rate-limited in publish loop."""
         with self._target_lock:
             self._waist_yaw_target = float(q)
+
+    def set_arm_tauff(self, tauff: np.ndarray) -> None:
+        """Set the 14-DoF arm feedforward torque (N·m). Thread-safe.
+
+        Applied as motor_cmd[j].tau on the wire. Use gravity_torque() from
+        g1_client.kinematics to compute the compensation torque; pass
+        np.zeros(14) to clear it when done."""
+        tauff = np.asarray(tauff, dtype=np.float64)
+        if tauff.shape != (14,):
+            raise ValueError(f"Expected shape (14,), got {tauff.shape}")
+        with self._target_lock:
+            self._tauff = tauff.copy()
 
     def set_velocity_limit(self, vlim: float):
         """Update the per-tick velocity clamp at runtime.
@@ -392,6 +408,7 @@ class ArmController:
                 with self._target_lock:
                     q_target = self._q_target.copy()
                     waist_yaw_target = self._waist_yaw_target
+                    tauff = self._tauff.copy()
 
                 q_current = self.get_arm_q()
                 q_cmd = self._clip_target(q_target, q_current)
@@ -408,7 +425,7 @@ class ArmController:
                     for idx, j in enumerate(ARM_JOINTS):
                         self.cmd.motor_cmd[j].q = float(q_cmd[idx])
                         self.cmd.motor_cmd[j].dq = 0.0
-                        self.cmd.motor_cmd[j].tau = 0.0
+                        self.cmd.motor_cmd[j].tau = float(tauff[idx])
                     self.cmd.motor_cmd[G1JointIndex.WaistYaw].q = waist_cmd
                     self.cmd.motor_cmd[G1JointIndex.WaistYaw].dq = 0.0
                     self.cmd.motor_cmd[G1JointIndex.WaistYaw].tau = 0.0

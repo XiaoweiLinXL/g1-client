@@ -213,11 +213,13 @@ _ARM_JOINT_MIN = np.array([-2.8,-0.4,-2.4,-1.1,-1.9,-1.5,-1.5,-2.8,-2.2,-2.4,-1.
 _ARM_JOINT_MAX = np.array([ 1.4, 2.2, 2.4, 2.9, 1.9, 1.7, 1.5, 1.4, 0.4, 2.4, 2.9, 1.9, 1.7, 1.5])
 
 
-def _run_inference_loop(arm, grip, cam, policy, args) -> None:
+def _run_inference_loop(arm, grip, cam, policy, args, kin=None) -> None:
     """Synchronous receding-horizon loop: infer chunk, execute, repeat.
 
     Arm actions are ABSOLUTE joint targets. The server's StateActionProcessor already
     converts training-time relative deltas → absolute using the obs-time state we send.
+    kin: optional G1DualArmKinematics instance; when provided, gravity feedforward
+    torques are computed and fed to the arm controller each step.
     """
     dt = 1.0 / args.control_hz
     prompt = args.prompt
@@ -269,18 +271,35 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
                 raise RuntimeError("ArmController control thread faulted — aborting")
             tic = time.time()
 
-            arm.set_arm_target(actions[t, :14])
+            a = actions[t]
+            arm.set_arm_target(a[:14])
             if actions.shape[1] > 16:
-                arm.set_waist_yaw_target(float(actions[t, 16]))
+                arm.set_waist_yaw_target(float(a[16]))
+            if kin is not None:
+                arm.set_arm_tauff(kin.gravity_torque(a[:14], args.tauff_scale))
 
             grip.set_targets(
-                float(np.clip(actions[t, 14], GRIPPER_MIN, GRIPPER_MAX)),
-                float(np.clip(actions[t, 15], GRIPPER_MIN, GRIPPER_MAX)),
+                float(np.clip(a[14], GRIPPER_MIN, GRIPPER_MAX)),
+                float(np.clip(a[15], GRIPPER_MIN, GRIPPER_MAX)),
             )
 
             sleep = dt - (time.time() - tic)
             if sleep > 0:
                 time.sleep(sleep)
+
+    if kin is not None:
+        arm.set_arm_tauff(np.zeros(14))
+
+
+# ---------- kinematics / gravity feedforward ----------
+
+def _load_kin(args):
+    if args.tauff_scale <= 0:
+        log.warning("gravity feedforward OFF (--tauff-scale 0): arm will sag under finite kp")
+        return None
+    from g1_client.kinematics import G1DualArmKinematics
+    log.info(f"Loading G1 arm kinematics for gravity feedforward (scale={args.tauff_scale})")
+    return G1DualArmKinematics()
 
 
 # ---------- pipeline stages ----------
@@ -358,6 +377,7 @@ def _run_test(args) -> None:
     cam = _FakeCamera()
     policy = None
     from g1_client.groot_policy import GR00TPolicy
+    kin = _load_kin(args)
     try:
         log.info(f"Connecting to GR00T server {args.server_host}:{args.server_port}")
         policy = GR00TPolicy(host=args.server_host, port=args.server_port,
@@ -366,7 +386,7 @@ def _run_test(args) -> None:
         log.info("Pinging server...")
         ok = policy.ping()
         log.info(f"Ping: {'OK' if ok else 'no response (continuing anyway)'}")
-        _run_inference_loop(arm, grip, cam, policy, args)
+        _run_inference_loop(arm, grip, cam, policy, args, kin=kin)
     finally:
         _cleanup(arm, grip, cam, policy)
 
@@ -398,6 +418,7 @@ def _run_real(args) -> None:
         _wait_for_operator(args)
         log.info(f"Switching arm kp to inference value: {args.inference_kp_arm}")
         arm.set_arm_kp(args.inference_kp_arm)
+        kin = _load_kin(args)
         log.info(f"Connecting to GR00T server {args.server_host}:{args.server_port}")
         policy = GR00TPolicy(host=args.server_host, port=args.server_port,
                              use_waist=not args.no_waist,
@@ -405,7 +426,7 @@ def _run_real(args) -> None:
         log.info("Pinging server...")
         ok = policy.ping()
         log.info(f"Ping: {'OK' if ok else 'no response (continuing anyway)'}")
-        _run_inference_loop(arm, grip, cam, policy, args)
+        _run_inference_loop(arm, grip, cam, policy, args, kin=kin)
         _initialize_pose(arm, grip, args, GROOT_INIT_POSE)
     finally:
         _cleanup(arm, grip, cam, policy)
@@ -443,6 +464,9 @@ def main() -> None:
     p.add_argument("--settle-duration", type=float, default=1.0)
     p.add_argument("--init-gripper-left", type=float, default=5.0)
     p.add_argument("--init-gripper-right", type=float, default=5.0)
+    p.add_argument("--tauff-scale", type=float, default=1.0,
+                   help="Scale on gravity-compensation feedforward torque (default 1.0). "
+                        "Set 0 to disable. Matches the sol_tauff fed at collection time.")
     p.add_argument("--no-waist", action="store_true",
                    help="Omit waist joint from state sent to server and do not command "
                         "waist from actions. Use with checkpoints trained without waist.")
