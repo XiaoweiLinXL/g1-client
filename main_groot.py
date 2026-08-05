@@ -83,8 +83,8 @@ ARM_JOINT_NAMES = [
 # INIT_POSE_READY (arms-at-sides neutral) which the model never saw at the beginning
 # of a task.  Recomputed for the put-away-tools (absolute, no-waist) checkpoint.
 GROOT_INIT_POSE = np.array([
-    +0.064,  0.008,  0.009, -0.208, -0.072, -0.014, -0.035,   # left
-    +0.044, -0.012,  0.045, -0.204, -0.013, -0.021,  0.017,   # right
+    +0.064,  0.008,  0.009, -0.785, -0.072, -0.014, -0.035,   # left
+    +0.044, -0.012,  0.045, -0.785, -0.013, -0.021,  0.017,   # right
 ], dtype=np.float64)
 
 _FAKE_IMG_H, _FAKE_IMG_W = 480, 640
