@@ -112,8 +112,8 @@ ARM_JOINT_MAX = np.array([
 PI_2 = 1.5707963267948966
 # INIT_POSE_READY = np.zeros(14)
 INIT_POSE_READY = np.array([
-     0.0,   0.0,  0.0,  -0.3,  0.0,  0.0,  0.0,   # left
-     0.0,   0.0,  0.0,  -0.3,  0.0,  0.0,  0.0,   # right
+     0.0,   0.0,  0.0,  -0.785,  0.0,  0.0,  0.0,   # left
+     0.0,   0.0,  0.0,  -0.785,  0.0,  0.0,  0.0,   # right
 ], dtype=np.float64)
 
 class ArmController:
