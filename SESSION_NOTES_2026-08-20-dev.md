@@ -129,7 +129,7 @@ Log now shows `skip=N blend=M` at each chunk boundary.
 ## Run command — bottle water task
 
 ```bash
-ssh unitree@192.168.10.62   # password: 123
+ssh unitree@192.168.10.62
 cd ~/g1-client && source .venv/bin/activate
 
 python main_openpi_sync.py \

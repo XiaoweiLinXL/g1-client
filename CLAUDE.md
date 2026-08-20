@@ -282,7 +282,7 @@ nohup ~/.local/bin/uv run python scripts/serve_policy.py \
 Run the client on PC2:
 
 ```bash
-ssh unitree@192.168.10.62  # password: 123
+ssh unitree@192.168.10.62
 cd ~/g1-client && source .venv/bin/activate
 python main_openpi.py \
     --iface enP8p1s0 \
