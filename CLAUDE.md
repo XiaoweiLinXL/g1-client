@@ -9,7 +9,7 @@ A standalone runtime inference client that drives a Unitree G1 humanoid's arms a
 - **LingBot-VA** (`main.py`) — stateful, FDM-grounded, autoregressive: `reset → cold_start → async_step × N`. Server port 29056.
 - **openpi `serve_policy.py`** (`main_openpi.py`, `main_openpi_sync.py`) — stateless, receding-horizon: repeated `infer(obs) → {"actions": [H,16]}`. Server port 8000.
 
-- **Isaac-GR00T** (`main_groot.py`) — stateless, receding-horizon: `infer(obs) → {"actions": [H,17]}` via ZMQ (port 5555). All action channels are **ABSOLUTE** joint targets (server's `StateActionProcessor` converts training-time relative deltas using the obs-time state we send); channel 16 is waist yaw.
+- **Isaac-GR00T** (`main_groot.py`) — stateless, receding-horizon: `infer(obs) → {"actions": [H,16|17]}` via ZMQ (port 5555). All action channels are **ABSOLUTE** joint targets applied directly (the server's `StateActionProcessor` already converts training-time relative deltas using the obs-time state we send). Channel 16 is waist yaw; use `--no-waist` for 16-dim checkpoints that omit it.
 
 Both paths share the same robot control code (`g1_client/` package). Only the policy data layer changes.
 
@@ -73,16 +73,22 @@ python test_async_safety.py
 Run the GR00T pipeline (see scripts/ for Azure VM setup):
 
 ```bash
+# First open SSH tunnel to the Azure A10 (keep running in a separate terminal):
+ssh -i ~/azure_files/a10-1.5-inference-fabricio_key.pem -N \
+    -L 5555:localhost:5555 \
+    fabricio@a10-pi05-embodyx.southcentralus.cloudapp.azure.com
+
+# Current checkpoint: put-away-tools (16-dim, no waist)
 python main_groot.py \
     --iface enp0s31f6 \
-    --server-host a10-pi05-embodyx.southcentralus.cloudapp.azure.com \
-    --server-port 5555 \
-    --prompt "Load the bottle water to the shelf"
+    --server-host 127.0.0.1 --server-port 5555 \
+    --no-waist \
+    --prompt "put the battery into the battery bin and the screw driver into the philips bin"
 
 # Test connectivity without a robot:
 python main_groot.py --test \
-    --server-host a10-pi05-embodyx.southcentralus.cloudapp.azure.com \
-    --prompt "Load the bottle water to the shelf"
+    --server-host 127.0.0.1 --server-port 5555 \
+    --no-waist --dry-run
 ```
 
 # Latency profiling for openpi servers — drives main_openpi's real loop with
@@ -116,12 +122,12 @@ Stateless receding-horizon loop: `infer(obs) → {"actions": [H=16, 16]}` over Z
 | Transport | WebSocket | ZMQ REQ/REP (port 5555) |
 | Obs format | flat dict, state (16,) | nested `video/state/language`, state split into 4 keys each `(1,1,D)` |
 | Image format | decoded RGB uint8 HxWx3 | decoded RGB uint8 `(1,1,H,W,3)` (no JPEG bypass) |
-| Action format | `[H,16]` absolute rad | 4-key dict; arm=RELATIVE deltas, gripper=ABSOLUTE |
+| Action format | `[H,16]` absolute rad | 4-key dict; all channels ABSOLUTE (arm + gripper) |
 | Server package | openpi JAX | Isaac-GR00T PyTorch on Azure A10 |
 
-**Obs conversion** (`g1_client/groot_policy.py`): JPEG bytes → RGB → `(1,1,H,W,3)`; state `(16,)` → split into `left_arm (1,1,7)`, `right_arm (1,1,7)`, `left_gripper (1,1,1)`, `right_gripper (1,1,1)`.
+**Obs conversion** (`g1_client/groot_policy.py`): JPEG bytes → RGB → `(1,1,H,W,3)`; state `(16,)` or `(17,)` → split into `left_arm (1,1,7)`, `right_arm (1,1,7)`, `left_gripper (1,1,1)`, `right_gripper (1,1,1)` (+ `waist (1,1,1)` when `use_waist=True`).
 
-**Action integration**: arm deltas are RELATIVE to the arm_q snapshot taken at obs capture time, not cumulative. `main_groot.py` does `arm_target[t] = obs_arm_q_snapshot + actions[t, :14]` for every step in the chunk.
+**Action integration**: all returned channels are ABSOLUTE joint targets — apply `actions[t, :]` directly to the arm/gripper controllers without adding the obs-time state. The server's `StateActionProcessor` has already reconstructed absolute targets from training-time relative deltas using the state we sent. Do NOT add `obs_arm_q`.
 
 **Wire format** (`g1_client/groot_policy.py`): `msgpack.packb` with `msgpack_numpy.encode` as default; `msgpack.unpackb` with `msgpack_numpy.decode` as object_hook — compatible with GR00T's `MsgSerializer`. Does NOT use the vendored `g1_client/msgpack_numpy.py` (which is the LingBot-VA WebSocket format).
 
@@ -166,14 +172,14 @@ Cloud LingBot-VA server  ──(WebSocket + msgpack_numpy)──►  PolicyClien
 Stateless receding-horizon loop: `infer(obs) → {"actions": [H, 16]}` on every tick. No `cold_start`, `reset`, or server state. Obs keys must match the checkpoint's `RepackTransform`/`DataConfig`:
 
 ```
-observation.images.cam_left_high    uint8 HxWx3 RGB   (main_openpi.py key)
-observation.images.cam_left_wrist   uint8 HxWx3 RGB
-observation.images.cam_right_wrist  uint8 HxWx3 RGB
-observation.state                   float32 (16,) = [14 arm q | L grip | R grip]
-prompt                              str
+observation/cam_left_high     uint8 HxWx3 RGB   (main_openpi.py wire keys, slash-separated)
+observation/cam_left_wrist    uint8 HxWx3 RGB
+observation/cam_right_wrist   uint8 HxWx3 RGB
+observation/state             float32 (16,) = [14 arm q | L grip | R grip]
+prompt                        str
 ```
 
-> **Key difference between the two openpi entry points:** `main_openpi.py` sends obs keys with dots (`observation.images.cam_left_high`), while `main_openpi_sync.py` maps to slash-separated keys (`observation/image`, `observation/left_wrist_image`, `observation/right_wrist_image`). Keep the obs key format in lockstep with your server checkpoint's `RepackTransform`.
+Note: `build_obs()` internally references `CameraClient` keys using dots (`observation.images.cam_left_high`) as the intermediate dict format; the slash-format keys above are what is sent over the wire to the server. `main_openpi_sync.py` uses different slash keys (`observation/image`, `observation/left_wrist_image`, `observation/right_wrist_image`). Keep the wire key format in lockstep with your server checkpoint's `RepackTransform`.
 
 **One-chunk prefetch with boundary smoothing.** `_run_inference_loop` in `main_openpi.py` executes the current chunk step-by-step at `--control-hz` (default 15 Hz). When `--prefetch-lead` steps remain, it snapshots a fresh obs and fires the next infer on a daemon thread so it overlaps the chunk tail. Two anti-jitter measures at chunk boundaries:
 - **Time-alignment** (`--chunk-align`, on by default): skip the leading `(n-1-i)` steps of a newly received chunk that already "elapsed" during inference, so the arm doesn't jump back then forward.
@@ -232,13 +238,57 @@ A single `try`/`finally` block in `run()` wraps everything from gripper init onw
 
 **`test_checkpoint_on_dataset.py`** — validates a deployed checkpoint against a HuggingFace LeRobot dataset. Loads frames from the dataset, sends them to a running policy server, and compares the first predicted action against ground truth. Low L2 error on training samples confirms the model learned the data; high error indicates a config mismatch (wrong norm stats, wrong obs key format, etc). Uses `main_openpi_sync.py`-style obs keys (`observation/image`, `observation/left_wrist_image`, `observation/right_wrist_image`). Requires `lerobot` installed.
 
+**`test_groot_on_dataset.py`** — validates a GR00T checkpoint against a HuggingFace LeRobot dataset, mirroring `test_checkpoint_on_dataset.py` but for the ZMQ/GR00T protocol. Requires a running GR00T server reachable via `--server-host`/`--server-port`.
+
 **`capture_frames.py`** — diagnostic: connects to the G1 image server, captures one frame from each camera, and saves them as RGB JPEGs. No DDS or arm control. Use to visually compare the actual camera setup against training dataset frames to diagnose mounting/angle mismatches before a run.
 
 ## `scripts/` — Azure VM deployment
 
 **`scripts/setup_azure_groot.sh`** — one-time setup for the Azure A10 VM (`fabricio@a10-pi05-embodyx.southcentralus.cloudapp.azure.com`, key at `~/azure_files/a10-1.5-inference-fabricio_key.pem`). Installs system deps (git-lfs, ffmpeg), clones Isaac-GR00T from GitHub, installs uv, and runs `uv sync --python 3.10`.
 
-**`scripts/launch_groot_server.sh`** — downloads the chosen GR00T checkpoint from HuggingFace (if not already local) and starts the ZMQ policy server on port 5555. Usage: `bash launch_groot_server.sh [9000step|18000step|30000step]`. Available checkpoints: `XiaoweiLinXL/unitree-GR00T-load-bottle-water-{9000,18000,30000}step`. Port 5555 must be open in the Azure NSG.
+**`scripts/launch_groot_server.sh`** — downloads the chosen GR00T checkpoint from HuggingFace (if not already local) and starts the ZMQ policy server on port 5555. Usage: `bash launch_groot_server.sh [9000step|18000step|30000step]`. Legacy checkpoints: `XiaoweiLinXL/unitree-GR00T-load-bottle-water-{9000,18000,30000}step`. Current put-away-tools checkpoint: `XiaoweiLinXL/groot-unitree-load-bottle-water-20k` (name is legacy; it holds the put-away-tools model). The A10 server is reached via SSH tunnel (`-L 5555:localhost:5555`), so the client connects to `127.0.0.1:5555`.
+
+## Camera hardware and teleimager service
+
+The client runs on PC2 (Jetson NX, `192.168.10.62`, user `unitree`, password `123`). Camera identity must be configured by `serial_number`, not `video_id` — `/dev/videoX` numbers shift on every reboot.
+
+| Camera | Serial | Notes |
+|--------|--------|-------|
+| Head (Arducam 1080P Low Light) | `UC684` | Must use `type: uvc` to avoid V4L2 USB bandwidth contention with the wrist cameras |
+| Left wrist (JSK-WDR) | `0001` | `type: opencv` |
+| Right wrist (JSK-WDR) | `0002` | `type: opencv` |
+
+Teleimager config: `/home/unitree/xr_teleoperate/teleop/teleimager/cam_config_server.yaml`. Service commands:
+
+```bash
+sudo systemctl restart teleimager
+sudo journalctl -u teleimager -f
+# If cameras disappear after a crash, re-attach the uvcvideo driver:
+sudo modprobe -r uvcvideo && sleep 1 && sudo modprobe uvcvideo
+```
+
+**openpi server** runs on `EmbodyX-server.local` (port 8000). Current checkpoint: `pi05_unitree_load_bottle_water_20k` in `~/xiaowei/openpi-finetuning/checkpoints/`. Start command:
+
+```bash
+cd ~/xiaowei/openpi-finetuning
+nohup ~/.local/bin/uv run python scripts/serve_policy.py \
+    --port 8000 \
+    policy:checkpoint \
+    --policy.config pi05_unitree_g1_load_bottle_water \
+    --policy.dir checkpoints/pi05_unitree_load_bottle_water_20k \
+    > /tmp/openpi_server.log 2>&1 &
+```
+
+Run the client on PC2:
+
+```bash
+ssh unitree@192.168.10.62  # password: 123
+cd ~/g1-client && source .venv/bin/activate
+python main_openpi.py \
+    --iface enP8p1s0 \
+    --server-host EmbodyX-server.local --server-port 8000 \
+    --prompt "load the bottle water to the shelf"
+```
 
 ## `openpi-fintune/` directory
 

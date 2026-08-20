@@ -67,10 +67,11 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("g1_openpi.main")
 
-# Action tensor layout for the G1 openpi checkpoint: [H, 16].
+# Action tensor layout for the G1 openpi checkpoint: [H, 16] or [H, 17] with --with-waist.
 ARM_CHANNELS = slice(0, 14)
 LEFT_GRIPPER_CHANNEL = 14
 RIGHT_GRIPPER_CHANNEL = 15
+WAIST_CHANNEL = 16
 
 ARM_JOINT_NAMES = [
     "L_pitch", "L_roll ", "L_yaw ", "L_elbow", "L_wrR ", "L_wrP ", "L_wrY ",
@@ -96,7 +97,7 @@ def _jpeg_to_rgb(jpeg_bytes: bytes) -> np.ndarray:
 
 
 def build_obs(cam: CameraClient, arm: ArmController, grip: GripperController,
-              prompt: str, send_jpeg: bool = False) -> dict:
+              prompt: str, send_jpeg: bool = False, with_waist: bool = False) -> dict:
     """Assemble one openpi observation from the (unchanged) controllers.
 
     send_jpeg=False (default): images are decoded RGB uint8 arrays — the legacy
@@ -112,14 +113,15 @@ def build_obs(cam: CameraClient, arm: ArmController, grip: GripperController,
     imgs = cam.get_obs_images()  # dict of JPEG bytes (BGR, q90), LeRobot keys
     left_q, right_q = grip.get_state()
     arm_q = arm.get_arm_q()  # (14,)
-    state = np.concatenate([arm_q, [left_q, right_q]]).astype(np.float32)  # (16,)
+    extra = [arm.get_waist_yaw()] if with_waist else []
+    state = np.concatenate([arm_q, [left_q, right_q], extra]).astype(np.float32)  # (16,) or (17,)
 
     def _img(key):
         return imgs[key] if send_jpeg else _jpeg_to_rgb(imgs[key])
     return {
-        "observation/image":             _img("observation.images.cam_left_high"),
-        "observation/left_wrist_image":  _img("observation.images.cam_left_wrist"),
-        "observation/right_wrist_image": _img("observation.images.cam_right_wrist"),
+        "observation/cam_left_high":   _img("observation.images.cam_left_high"),
+        "observation/cam_left_wrist":  _img("observation.images.cam_left_wrist"),
+        "observation/cam_right_wrist": _img("observation.images.cam_right_wrist"),
         "observation/state":             state,
         "prompt":                        prompt,
     }
@@ -249,7 +251,7 @@ def _infer_worker(policy: PolicyClient, obs: dict, box: dict) -> None:
         box["err"] = e
 
 
-def _run_inference_loop(arm, grip, cam, policy, args) -> None:
+def _run_inference_loop(arm, grip, cam, policy, args, kin=None) -> None:
     """Receding-horizon loop with one-chunk prefetch + boundary smoothing.
 
     Execute the current chunk at args.control_hz on the main thread; when
@@ -276,7 +278,7 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
 
     # First chunk is a blocking infer (nothing to overlap it against yet).
     log.info(f"First inference (prompt={prompt!r})")
-    result = policy.infer(build_obs(cam, arm, grip, prompt, args.send_jpeg))
+    result = policy.infer(build_obs(cam, arm, grip, prompt, args.send_jpeg, args.with_waist))
     actions = np.asarray(result["actions"],dtype=np.float64)
     if actions.ndim != 2 or actions.shape[1] < 16:
         raise RuntimeError(f"Unexpected action shape {actions.shape} (want [H, 16])")
@@ -318,6 +320,10 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
                 alpha = (i + 1) / (args.blend_steps + 1)
                 a = (1.0 - alpha) * last_cmd + alpha * a
             arm.set_arm_target(a[ARM_CHANNELS])
+            if kin is not None:
+                arm.set_arm_tauff(kin.gravity_torque(a[ARM_CHANNELS], args.tauff_scale))
+            if args.with_waist and len(a) > WAIST_CHANNEL:
+                arm.set_waist_yaw_target(float(a[WAIST_CHANNEL]))
             grip.set_targets(
                 float(np.clip(a[LEFT_GRIPPER_CHANNEL], GRIPPER_MIN, GRIPPER_MAX)),
                 float(np.clip(a[RIGHT_GRIPPER_CHANNEL], GRIPPER_MIN, GRIPPER_MAX)),
@@ -329,7 +335,7 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
             # chunk will be when we adopt it, so we skip that many of its leading
             # steps to stay time-aligned (disable with --no-chunk-align).
             if th is None and (n - i) <= lead:
-                obs_next = build_obs(cam, arm, grip, prompt, args.send_jpeg)
+                obs_next = build_obs(cam, arm, grip, prompt, args.send_jpeg, args.with_waist)
                 pending_skip = (n - 1 - i) if args.chunk_align else 0
                 th = threading.Thread(target=_infer_worker,
                                       args=(policy, obs_next, box),
@@ -364,6 +370,8 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
         start_idx = min(pending_skip, next_actions.shape[0] - 1)
 
     _summarize_timing(infer_recs, chunk_recs, args)
+    if kin is not None:
+        arm.set_arm_tauff(np.zeros(14))
 
 
 # ---------- pipeline stages (kept identical in spirit to main.py) ----------
@@ -446,7 +454,14 @@ def run(args) -> None:
         log.info(f"Switching arm kp to inference value: {args.inference_kp_arm}")
         arm.set_arm_kp(args.inference_kp_arm)
         policy = PolicyClient(host=args.server_host, port=args.server_port)
-        _run_inference_loop(arm, grip, cam, policy, args)
+        kin = None
+        if args.tauff_scale > 0:
+            from g1_client.kinematics import G1DualArmKinematics
+            log.info(f"Loading G1 arm kinematics for gravity feedforward (scale={args.tauff_scale})")
+            kin = G1DualArmKinematics()
+        else:
+            log.warning("gravity feedforward OFF (--tauff-scale 0): arm will sag under finite kp")
+        _run_inference_loop(arm, grip, cam, policy, args, kin=kin)
         _initialize_pose(arm, grip, args)
     finally:
         _cleanup(arm, grip, cam, policy)
@@ -494,6 +509,12 @@ def main() -> None:
     p.add_argument("--settle-duration", type=float, default=1.0)
     p.add_argument("--init-gripper-left", type=float, default=5.0)
     p.add_argument("--init-gripper-right", type=float, default=5.0)
+    p.add_argument("--with-waist", action="store_true",
+                   help="Include waist yaw in observation state (17-dim) and command it "
+                        "from action channel 16. Use with checkpoints trained with waist.")
+    p.add_argument("--tauff-scale", type=float, default=1.0,
+                   help="Gravity feedforward scale (1.0=full, 0=off). Matches sol_tauff "
+                        "fed at collection time. Set 0 to disable.")
     p.add_argument("--auto-start", action="store_true",
                    help="Skip the post-init Enter prompt and start immediately.")
     args = p.parse_args()

@@ -451,10 +451,8 @@ def _run_inference_loop_async(arm, grip, cam, policy, args, kin=None) -> None:
                 raise RuntimeError("ArmController control thread faulted — aborting")
             tic = time.time()
             a = actions[i].astype(np.float64)
-            # Blend the first blend_count steps from last_cmd into the new chunk.
-            # blend_count = elapsed_steps since obs capture, so the stale leading
-            # steps (which the model predicted for time already passed) are eased
-            # in from the robot's actual current pose rather than snapping or skipping.
+            # Cross-fade the first blend_count steps from last_cmd into the new chunk
+            # to smooth any residual discontinuity after the stale-step skip.
             if last_cmd is not None and i < blend_count:
                 alpha = (i + 1) / (blend_count + 1)
                 a = (1.0 - alpha) * last_cmd + alpha * a
@@ -504,19 +502,22 @@ def _run_inference_loop_async(arm, grip, cam, policy, args, kin=None) -> None:
         #     finished the chunk and still had to wait — shouldn't happen
         #     with early-break, but kept as a safety net)
         elapsed_steps = steps_since_obs + int(join_wait_s * args.control_hz)
-        blend_count = min(elapsed_steps, next_actions.shape[0] - 1)
+        # Skip stale leading steps (predicted for time already passed) then
+        # apply a small fixed blend on the first non-stale steps.
+        skip = min(elapsed_steps, next_actions.shape[0] - 1)
+        blend_count = args.blend_steps
 
         rec = _timing_rec(box.get("timing", {}), box.get("server_ms"))
         infer_recs.append(rec)
         chunk_recs.append({"exec_s": exec_s, "join_wait_s": join_wait_s})
         log.info(f"[chunk {c}] execute={exec_s:.2f}s join_wait={join_wait_s*1e3:.0f}ms "
-                 f"blend={blend_count} | "
+                 f"skip={skip} blend={blend_count} | "
                  f"infer wall={rec['wall_ms']:.0f}ms pack={rec['pack_ms']:.0f} "
                  f"send={rec['send_ms']:.0f} wait_recv={rec['wait_recv_ms']:.0f} "
                  f"unpack={rec['unpack_ms']:.0f}"
                  + (f" server={rec['server_ms']:.0f}" if rec['server_ms'] is not None else ""))
         log_chunk_ranges(c, next_actions)
-        actions = next_actions
+        actions = next_actions[skip:]
 
     if kin is not None:
         arm.set_arm_tauff(np.zeros(14))
